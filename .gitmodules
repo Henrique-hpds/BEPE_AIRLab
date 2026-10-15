@@ -1,0 +1,3 @@
+[submodule "Fast-SAM-3D-Body"]
+	path = Fast-SAM-3D-Body
+	url = git@github.com:yangtiming/Fast-SAM-3D-Body.git
