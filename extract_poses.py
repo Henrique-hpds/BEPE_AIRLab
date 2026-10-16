@@ -172,10 +172,11 @@ def camera_reference(gravity):
 
 
 def convert_pose(output, converter, rotation):
-    """Repeat the publisher's conversion and protocol transforms unchanged."""
+    """Keep publisher fields and add standard SMPL parameters in camera space."""
     import numpy as np
     from scipy.spatial.transform import Rotation
     from mocap.utils.pose_protocol import prepare_publish_pose
+    from smpl_parameters import camera_smpl_parameters
 
     vertices = np.asarray(output["pred_vertices"], dtype=np.float32)
     translation = np.asarray(output["pred_cam_t"], dtype=np.float32)
@@ -183,10 +184,17 @@ def convert_pose(output, converter, rotation):
     body_rotation = Rotation.from_euler("ZYX", global_rotation)
     x180 = Rotation.from_euler("x", 180.0, degrees=True)
     body_quat_xyzw = (x180 * body_rotation).as_quat().astype(np.float64)
-    smpl_pose, canonical_joints, _betas, _weights = converter.infer(
+    smpl_pose, canonical_joints, betas, _weights = converter.infer(
         [(vertices, translation)]
     )
-    return prepare_publish_pose(body_quat_xyzw, canonical_joints, smpl_pose, rotation)
+    body_quat, smpl_joints, smpl_pose = prepare_publish_pose(
+        body_quat_xyzw, canonical_joints, smpl_pose, rotation,
+    )
+    return {
+        "body_quat": body_quat, "smpl_joints": smpl_joints, "smpl_pose": smpl_pose,
+        "pred_cam_t": translation.astype(np.float64),
+        **camera_smpl_parameters(converter, vertices, translation, smpl_pose, betas),
+    }
 
 
 def create_visualizer(output_dir, estimator, fps, options):
@@ -197,7 +205,7 @@ def create_visualizer(output_dir, estimator, fps, options):
 
 def extract_video(video_path, output_dir, estimator, converter, *, gravity=None,
                   bbox_threshold=0.5, verbose=False, progress_position=0,
-                  visualization=None):
+                  visualization=None, smpl_model_path=None):
     """Process every decoded frame sequentially; save only single-person poses."""
     import cv2
     import numpy as np
@@ -206,6 +214,9 @@ def extract_video(video_path, output_dir, estimator, converter, *, gravity=None,
     rotation = camera_reference(gravity)
     capture = cv2.VideoCapture(str(video_path))
     timestamps, quaternions, joints, poses = [], [], [], []
+    parameter_names = ("body_pose", "global_orient", "betas", "transl", "pred_cam_t")
+    parameters = {name: [] for name in parameter_names}
+    frame_indices = []
     frames_read = no_person = multiple_people = 0
     start_time = time.time()
     visualizer = None
@@ -247,21 +258,19 @@ def extract_video(video_path, output_dir, estimator, converter, *, gravity=None,
                     no_person += len(outputs) == 0
                     multiple_people += len(outputs) > 1
                 else:
-                    body_quat, smpl_joints, smpl_pose = convert_pose(outputs[0], converter, rotation)
+                    smpl_record = convert_pose(outputs[0], converter, rotation)
                     # Match VideoFileSource: Unix start time + the frame's media timestamp.
                     timestamps.append(start_time + frame_index / fps)
-                    quaternions.append(body_quat)
-                    joints.append(smpl_joints)
-                    poses.append(smpl_pose)
-                    smpl_record = {
-                        "frame_index": frame_index,
-                        "body_quat": body_quat,
-                        "smpl_joints": smpl_joints,
-                        "smpl_pose": smpl_pose,
-                    }
+                    quaternions.append(smpl_record["body_quat"])
+                    joints.append(smpl_record["smpl_joints"])
+                    poses.append(smpl_record["smpl_pose"])
+                    frame_indices.append(frame_index)
+                    for name in parameter_names:
+                        parameters[name].append(smpl_record[name])
+                    smpl_record["frame_index"] = frame_index
                 if visualizer is not None and visualization_error is None:
                     try:
-                        visualizer.write(frame_index, frame, outputs, smpl_record)
+                        visualizer.write(frame_index, frame, outputs)
                     except Exception as error:
                         visualization_error = error
                         LOGGER.error("Visualization failed at frame %d: %s; continuing pose extraction",
@@ -284,6 +293,7 @@ def extract_video(video_path, output_dir, estimator, converter, *, gravity=None,
 
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
+        "schema_version": 2,
         "source_video": str(video_path),
         "fps": fps,
         "frames_read": frames_read,
@@ -296,6 +306,19 @@ def extract_video(video_path, output_dir, estimator, converter, *, gravity=None,
         "orientation_reference": "camera" if gravity is None else "gravity_aligned",
         "gravity": gravity,
         "R_world_cam": rotation.tolist(),
+        "smpl": {
+            "model_type": "SMPL", "gender": "neutral", "num_betas": 10,
+            "model_path": str(smpl_model_path) if smpl_model_path is not None else None,
+            "coordinate_frame": "OpenCV camera: +X right, +Y down, +Z forward",
+            "length_units": "metres", "rotation_representation": "axis-angle, radians",
+            "body_pose_order": "SMPL joints 1..23; joints 22 and 23 fixed to zero",
+            "global_orient_source": "rigid fit of posed SMPL to mapped MHR vertices",
+            "transl_source": "same rigid fit, accounting for SMPL pelvis rotation pivot",
+            "transl_semantics": "SMPL additive translation; not the pelvis position or pred_cam_t",
+            "gravity_applied": False,
+            "shape_source": "MHR-to-SMPL converter, estimated per saved frame",
+            "smoother_applies_to": "smpl_joints only; SMPL parameters are not smoothed",
+        },
         "visualization": {
             "status": ("disabled" if visualization is None else
                        "failed" if visualization_error is not None else "complete"),
@@ -315,6 +338,9 @@ def extract_video(video_path, output_dir, estimator, converter, *, gravity=None,
                 body_quats=np.asarray(quaternions, dtype=np.float64).reshape(-1, 4),
                 smpl_joints=np.asarray(joints, dtype=np.float64).reshape(-1, 24, 3),
                 smpl_poses=np.asarray(poses, dtype=np.float64).reshape(-1, 21, 3),
+                frame_indices=np.asarray(frame_indices, dtype=np.int64),
+                **{name: np.asarray(parameters[name], dtype=np.float64).reshape(-1, size)
+                   for name, size in zip(parameter_names, (69, 3, 10, 3, 3))},
             )
         temporary_path.replace(output_dir / "smpl_data.npz")
     finally:
@@ -336,16 +362,8 @@ def parse_args(argv=None):
                         help="Output folder (default: <repository>/output)")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing archives")
     parser.add_argument("--verbose", action="store_true", help="Show original model diagnostics and tracebacks")
-    parser.add_argument("--visualize", action="store_true",
-                        help="Save live MHR panels and SMPL front/side videos")
-    parser.add_argument("--save-images", action="store_true",
-                        help="Save original, boxes, skeleton, mesh views and SMPL frame images")
-    parser.add_argument("--save-meshes", action="store_true",
-                        help="Save live MHR and SMPL meshes as PLY files")
-    parser.add_argument("--visualize-all", action="store_true",
-                        help="Enable visualization videos, frame images and PLY exports")
-    parser.add_argument("--export-every", type=int, default=1,
-                        help="Export images/PLY every N frames; videos keep all frames (default: 1)")
+    parser.add_argument("--visualize", "--visualize-all", action="store_true",
+                        help="Save one video: original + boxes, skeleton, mesh overlay and side view")
     parser.add_argument("--viz-height", type=int, default=480,
                         help="Even visualization video panel height in pixels (default: 480)")
     parser.add_argument("--video-codec", default="mp4v",
@@ -366,10 +384,6 @@ def parse_args(argv=None):
     parser.add_argument("--gravity", type=float, nargs=3, metavar=("GX", "GY", "GZ"),
                         help="Optional gravity vector in camera coordinates; otherwise use camera reference")
     args = parser.parse_args(argv)
-    if args.visualize_all:
-        args.visualize = args.save_images = args.save_meshes = True
-    if args.export_every < 1:
-        parser.error("--export-every must be at least 1")
     if args.viz_height < 64 or args.viz_height % 2:
         parser.error("--viz-height must be an even integer of at least 64")
     if len(args.video_codec) != 4 or not args.video_codec.isascii():
@@ -408,13 +422,8 @@ def main(argv=None):
         if args.gravity is None:
             LOGGER.info("No gravity supplied: orientations use the camera reference, without gravity alignment")
         visualization = None
-        if args.visualize or args.save_images or args.save_meshes:
+        if args.visualize:
             visualization = {
-                "smpl_model_path": str(args.smpl_model_path),
-                "save_videos": args.visualize,
-                "save_images": args.save_images,
-                "save_meshes": args.save_meshes,
-                "export_every": args.export_every,
                 "height": args.viz_height,
                 "codec": args.video_codec,
             }
@@ -435,7 +444,8 @@ def main(argv=None):
                                       gravity=args.gravity, bbox_threshold=args.bbox_threshold,
                                       verbose=args.verbose,
                                       progress_position=1 if len(jobs) > 1 else 0,
-                                      visualization=visualization)
+                                      visualization=visualization,
+                                      smpl_model_path=args.smpl_model_path)
                     except Exception as error:
                         LOGGER.error("Failed to process %s: %s", video, error,
                                      exc_info=args.verbose)
